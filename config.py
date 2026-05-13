@@ -19,15 +19,17 @@ UNIVERSES = {
 
 # Training data window (days) for world model
 TRAIN_WINDOW = 252
-# Latent state dimensions
-RSSM_DETERMINISTIC = 64
-RSSM_STOCHASTIC = 32
-RSSM_HIDDEN = 64
+# Latent dimensions
+DETER_DIM = 64
+STOCH_DIM = 32
+HIDDEN_DIM = 64
 
 # World model training
 WM_BATCH_SIZE = 32
 WM_LEARNING_RATE = 1e-3
 WM_EPOCHS = 50
+# Sequence length for world model training
+SEQUENCE_LENGTH = 20
 
 # Actor-critic training on imagined rollouts
 ROLLOUT_LENGTH = 20
@@ -35,8 +37,10 @@ ACTOR_HIDDEN = 64
 ACTOR_LEARNING_RATE = 1e-4
 ACTOR_EPOCHS = 100
 ACTOR_BATCH_SIZE = 32
+# Discount factor
+GAMMA = 0.99
 
-# Risk-free rate for portfolio returns (daily)
+# Risk-free rate (daily)
 RISK_FREE_RATE = 0.0
 
-TOP_N = 3   # Number of ETFs to output (will show top weights)
+TOP_N = 3
