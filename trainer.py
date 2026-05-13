@@ -25,7 +25,8 @@ def compute_gae(rewards, values, gamma=0.99, lam=0.95):
         delta = rewards[t] + gamma * values[t+1] - values[t] if t+1 < len(values) else rewards[t] - values[t]
         gae = delta + gamma * lam * gae
         advantages.insert(0, gae)
-    return torch.tensor(advantages, dtype=torch.float32)
+    # Detach before converting to tensor
+    return torch.tensor(advantages, dtype=torch.float32).detach()
 
 def main():
     if not config.HF_TOKEN:
@@ -111,69 +112,73 @@ def main():
 
         print("  Training actor-critic on imagined rollouts...")
         for epoch in range(config.ACTOR_EPOCHS):
-            # Generate one batch of imagined rollouts from the initial latent state
-            # We'll generate multiple rollouts using different random seeds (same initial state)
-            batch_rollouts = []
+            actor_loss_total = 0.0
+            critic_loss_total = 0.0
+            # Generate a batch of rollouts
             for _ in range(config.ACTOR_BATCH_SIZE):
+                # Start from initial latent state (clone to avoid mutation)
                 deter = initial_deter.clone()
                 stoch = initial_stoch.clone()
                 log_probs = []
                 rewards = []
                 values = []
-                actions = []
+                # We'll generate rollout step by step
                 for t in range(config.ROLLOUT_LENGTH):
+                    # Get action distribution from actor
                     action_probs = actor(deter, stoch)  # (1, action_dim)
-                    # Sample from distribution (categorical softmax)
                     dist = torch.distributions.Categorical(action_probs)
-                    action = dist.sample()  # scalar index
+                    action = dist.sample()
                     log_prob = dist.log_prob(action)
-                    # Convert action to one-hot for world model step
+                    # One-hot action for world model
                     one_hot = torch.zeros(1, action_dim, device=device)
                     one_hot[0, action] = 1.0
-                    # Step world model (prior only)
-                    gru_input = torch.cat([stoch, deter, one_hot], dim=-1)
-                    deter = world_model.rssm.rssm_cell.gru(gru_input, deter)
-                    prior_params = world_model.rssm.rssm_cell.prior_net(deter)
-                    prior_mean, prior_logstd = prior_params.chunk(2, dim=-1)
-                    prior_std = torch.exp(prior_logstd)
-                    eps = torch.randn_like(prior_mean)
-                    stoch = prior_mean + eps * prior_std
-                    # Predict reward and value
-                    reward = world_model.reward_pred(deter, stoch).squeeze()
-                    value = critic(deter, stoch).squeeze()
-                    log_probs.append(log_prob)
+                    # Step world model (prior only) – no gradients through world model
+                    with torch.no_grad():
+                        gru_input = torch.cat([stoch, deter, one_hot], dim=-1)
+                        next_deter = world_model.rssm.rssm_cell.gru(gru_input, deter)
+                        prior_params = world_model.rssm.rssm_cell.prior_net(next_deter)
+                        prior_mean, prior_logstd = prior_params.chunk(2, dim=-1)
+                        prior_std = torch.exp(prior_logstd)
+                        eps = torch.randn_like(prior_mean)
+                        next_stoch = prior_mean + eps * prior_std
+                        # Reward and value predictions (world_model.reward_pred and critic)
+                        reward = world_model.reward_pred(next_deter, next_stoch).squeeze().detach()
+                        value = critic(next_deter, next_stoch).squeeze().detach()
+                    # Detach log_prob as well to avoid graph accumulation across steps
+                    log_probs.append(log_prob.detach())
                     rewards.append(reward)
                     values.append(value)
-                    actions.append(one_hot)
-                # Compute advantages (GAE)
+                    # Update state
+                    deter = next_deter
+                    stoch = next_stoch
+                # Compute advantages and returns (all detached)
                 values_appended = values + [critic(deter, stoch).squeeze().detach()]
                 advantages = compute_gae(rewards, values_appended, gamma=config.GAMMA, lam=0.95)
-                batch_rollouts.append((log_probs, advantages, rewards, values, actions))
-            # Update actor and critic
-            actor_loss = 0.0
-            critic_loss = 0.0
-            for log_probs, advantages, rewards, values, actions in batch_rollouts:
-                log_prob_sum = torch.stack(log_probs).sum()
-                # Actor loss: -log_prob * advantage (with advantage detach)
-                actor_loss += -(log_prob_sum * advantages.mean().detach())
-                # Critic loss: MSE between predicted value and bootstrapped return
+                # Compute returns (discounted sum of rewards)
                 returns = []
                 R = 0
                 for r in reversed(rewards):
                     R = r + config.GAMMA * R
                     returns.insert(0, R)
-                returns = torch.tensor(returns, device=device)
-                critic_loss += nn.MSELoss()(torch.stack(values), returns)
-            actor_loss /= len(batch_rollouts)
-            critic_loss /= len(batch_rollouts)
+                returns_tensor = torch.tensor(returns, device=device, dtype=torch.float32).detach()
+                # Actor loss: -log_prob * advantage (advantage is detached)
+                actor_loss = - (torch.stack(log_probs) * advantages).sum()
+                # Critic loss: MSE between predicted values and returns
+                critic_loss = nn.MSELoss()(torch.stack(values), returns_tensor)
+                actor_loss_total += actor_loss
+                critic_loss_total += critic_loss
+            # Average losses over batch
+            actor_loss_total /= config.ACTOR_BATCH_SIZE
+            critic_loss_total /= config.ACTOR_BATCH_SIZE
+            # Update networks
             actor_optim.zero_grad()
-            actor_loss.backward()
+            actor_loss_total.backward()
             actor_optim.step()
             critic_optim.zero_grad()
-            critic_loss.backward()
+            critic_loss_total.backward()
             critic_optim.step()
             if (epoch+1) % 20 == 0:
-                print(f"    Actor-critic epoch {epoch+1}/{config.ACTOR_EPOCHS}, actor loss: {actor_loss.item():.4f}, critic loss: {critic_loss.item():.4f}")
+                print(f"    Epoch {epoch+1}/{config.ACTOR_EPOCHS}, actor loss: {actor_loss_total.item():.4f}, critic loss: {critic_loss_total.item():.4f}")
 
         # After training, get greedy action from actor on initial state
         with torch.no_grad():
